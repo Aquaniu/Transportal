@@ -423,7 +423,6 @@ def serve(host: str, port: int, save_dir: str, allow_sources: Optional[List[str]
 def _default_config_paths() -> List[str]:
     paths = []
     cwd_path = os.path.join(os.getcwd(), "lan_config.json")
-    print(cwd_path)
     home_path = os.path.join(os.path.expanduser("~"), ".lan_transfer.json")
     paths.append(cwd_path)
     paths.append(home_path)
@@ -578,7 +577,6 @@ def repl(cfg: Dict[str, Any]):
 
 def main():
     args = parse_args()
-    print(args)
     cfg, cfg_path = load_config(getattr(args, "config", None))
     if cfg_path:
         print(f"[CONFIG] Loaded from {cfg_path}")
