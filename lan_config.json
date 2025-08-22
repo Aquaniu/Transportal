@@ -1,0 +1,18 @@
+{
+  "bind_host": "0.0.0.0",
+  "default_port": 50080,
+  "save_dir": "received",
+  "encryption_key": "***",
+  "allow_sources": [
+    "192.168.0.0/16",
+    "10.0.0.0/8",
+    "127.0.0.1"
+  ],
+  "aliases": {
+    "mac": "192.168.11.**",
+    "main": "192.168.10.**"
+  },
+  "default_target": "main"
+}
+
+
