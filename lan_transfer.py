@@ -204,12 +204,14 @@ def send_file(host: str, port: int, filepath: str, timeout: float = 30.0, show_p
         temp_path = filepath + ".tmp.enc"
         try:
             with open(filepath, "rb") as f_in, open(temp_path, "wb") as f_out:
-                # 分块加密文件，每个块独立加密
+                # 分块加密文件，每个块独立加密，并写入长度前缀，确保接收端解密时按块对齐
                 while True:
                     chunk = f_in.read(RECV_BUF)
                     if not chunk:
                         break
                     encrypted_chunk = cipher.encrypt(chunk)
+                    # 写入 4 字节大端长度前缀，随后写入该加密块
+                    f_out.write(struct.pack(">I", len(encrypted_chunk)))
                     f_out.write(encrypted_chunk)
             
             # 更新文件大小为加密后的大小
@@ -337,17 +339,23 @@ def _handle_conn(conn: socket.socket, addr: Tuple[str, int], save_dir: str, ciph
             if is_encrypted and cipher:
                 try:
                     with open(temp_path, "rb") as f_in, open(out_path, "wb") as f_out:
-                        # 分块解密文件，每个块独立解密
+                        # 解析 [4字节长度][加密块] ... 的帧格式，逐块解密
                         while True:
-                            chunk = f_in.read(RECV_BUF)
-                            if not chunk:
+                            len_bytes = f_in.read(4)
+                            if not len_bytes:
                                 break
+                            if len(len_bytes) != 4:
+                                raise ValueError("加密文件长度前缀不完整")
+                            (enc_len,) = struct.unpack(">I", len_bytes)
+                            if enc_len <= 0:
+                                raise ValueError("非法的加密块长度")
+                            enc_chunk = _read_exact(f_in, enc_len)
                             try:
-                                decrypted_chunk = cipher.decrypt(chunk)
+                                decrypted_chunk = cipher.decrypt(enc_chunk)
                                 f_out.write(decrypted_chunk)
                             except Exception as e:
                                 print(f"[ERROR] Failed to decrypt chunk: {e}")
-                                # 如果某个块解密失败，尝试跳过
+                                # 如果某个块解密失败，尝试跳过该块
                                 continue
                     # 删除临时加密文件
                     os.remove(temp_path)
