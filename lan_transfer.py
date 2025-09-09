@@ -233,12 +233,27 @@ def send_file(host: str, port: int, filepath: str, timeout: float = 30.0, show_p
                 sent = 0
                 start = time.time()
                 with open(temp_path, "rb") as f:
+                    # 按长度前缀格式发送加密文件
                     while True:
-                        chunk = f.read(RECV_BUF)
-                        if not chunk:
+                        # 读取长度前缀
+                        len_bytes = f.read(4)
+                        if not len_bytes:
                             break
-                        s.sendall(chunk)
-                        sent += len(chunk)
+                        if len(len_bytes) != 4:
+                            raise ValueError("加密文件长度前缀不完整")
+                        (enc_len,) = struct.unpack(">I", len_bytes)
+                        if enc_len <= 0:
+                            raise ValueError("非法的加密块长度")
+                        
+                        # 读取加密块
+                        enc_chunk = f.read(enc_len)
+                        if len(enc_chunk) != enc_len:
+                            raise ValueError("加密块长度不匹配")
+                        
+                        # 发送长度前缀 + 加密块
+                        s.sendall(len_bytes)
+                        s.sendall(enc_chunk)
+                        sent += 4 + enc_len
                         if show_progress:
                             _print_progress(f"Sending {filename}", sent, encrypted_filesize, start)
                 if show_progress:
@@ -322,16 +337,39 @@ def _handle_conn(conn: socket.socket, addr: Tuple[str, int], save_dir: str, ciph
             last_print = 0.0
             temp_path = out_path + ".tmp.enc" if is_encrypted else out_path
             with open(temp_path, "wb") as f:
-                while received < filesize:
-                    chunk = conn.recv(min(RECV_BUF, filesize - received))
-                    if not chunk:
-                        raise ConnectionError("connection closed before file fully received")
-                    f.write(chunk)
-                    received += len(chunk)
-                    now = time.time()
-                    if now - last_print >= 0.1:  # 限速刷新
-                        _print_progress(f"Receiving {safe_name}", received, filesize, start)
-                        last_print = now
+                if is_encrypted:
+                    # 加密文件按长度前缀格式接收
+                    while received < filesize:
+                        # 接收长度前缀
+                        len_bytes = _read_exact(conn, 4)
+                        (enc_len,) = struct.unpack(">I", len_bytes)
+                        if enc_len <= 0:
+                            raise ValueError("非法的加密块长度")
+                        
+                        # 接收加密块
+                        enc_chunk = _read_exact(conn, enc_len)
+                        
+                        # 写入长度前缀 + 加密块
+                        f.write(len_bytes)
+                        f.write(enc_chunk)
+                        received += 4 + enc_len
+                        
+                        now = time.time()
+                        if now - last_print >= 0.1:  # 限速刷新
+                            _print_progress(f"Receiving {safe_name}", received, filesize, start)
+                            last_print = now
+                else:
+                    # 未加密文件按原方式接收
+                    while received < filesize:
+                        chunk = conn.recv(min(RECV_BUF, filesize - received))
+                        if not chunk:
+                            raise ConnectionError("connection closed before file fully received")
+                        f.write(chunk)
+                        received += len(chunk)
+                        now = time.time()
+                        if now - last_print >= 0.1:  # 限速刷新
+                            _print_progress(f"Receiving {safe_name}", received, filesize, start)
+                            last_print = now
             _print_progress(f"Receiving {safe_name}", filesize, filesize, start)
             print("")
             
