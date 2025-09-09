@@ -121,6 +121,19 @@ def _read_exact(sock: socket.socket, nbytes: int) -> bytes:
     return b"".join(chunks)
 
 
+def _read_exact_file(fp, nbytes: int) -> bytes:
+    """从文件对象精确读取 nbytes 字节。"""
+    chunks = []
+    remaining = nbytes
+    while remaining > 0:
+        chunk = fp.read(remaining)
+        if not chunk:
+            raise EOFError("file truncated while reading")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def _get_cipher(cfg: Dict[str, Any]) -> Optional[StandardAESCipher]:
     """根据配置获取加密器"""
     password = cfg.get("encryption_key")
@@ -387,7 +400,7 @@ def _handle_conn(conn: socket.socket, addr: Tuple[str, int], save_dir: str, ciph
                             (enc_len,) = struct.unpack(">I", len_bytes)
                             if enc_len <= 0:
                                 raise ValueError("非法的加密块长度")
-                            enc_chunk = _read_exact(f_in, enc_len)
+                            enc_chunk = _read_exact_file(f_in, enc_len)
                             try:
                                 decrypted_chunk = cipher.decrypt(enc_chunk)
                                 f_out.write(decrypted_chunk)
