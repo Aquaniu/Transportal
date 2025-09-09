@@ -46,17 +46,24 @@ class StandardAESCipher:
         return self._xor_decrypt(encrypted_data, iv)
     
     def _xor_encrypt(self, data: bytes, iv: bytes) -> bytes:
-        """使用 XOR 和 HMAC 的简单加密"""
+        """使用 XOR 和 HMAC 的简单加密（优化版）"""
         # 生成密钥流
         key_stream = self._generate_key_stream(iv, len(data))
-        # XOR 加密
-        encrypted = bytes(a ^ b for a, b in zip(data, key_stream))
+        # 使用 bytearray + memoryview 执行 XOR，减少中间对象
+        out = bytearray(len(data))
+        mv_out = memoryview(out)
+        mv_data = memoryview(data)
+        mv_key = memoryview(key_stream)
+        step = 1024 * 64
+        for offset in range(0, len(data), step):
+            end = offset + step if offset + step < len(data) else len(data)
+            mv_out[offset:end] = bytes(a ^ b for a, b in zip(mv_data[offset:end], mv_key[offset:end]))
         # 添加 HMAC 验证
-        h = hmac.new(self.key, iv + encrypted, hashlib.sha256)
-        return encrypted + h.digest()[:8]  # 添加 8 字节的 HMAC
+        h = hmac.new(self.key, iv + out, hashlib.sha256)
+        return bytes(out) + h.digest()[:8]  # 添加 8 字节的 HMAC
     
     def _xor_decrypt(self, data: bytes, iv: bytes) -> bytes:
-        """使用 XOR 和 HMAC 的简单解密"""
+        """使用 XOR 和 HMAC 的简单解密（优化版）"""
         if len(data) < 8:
             raise ValueError("数据太短，无法解密")
         # 分离数据和 HMAC
@@ -70,19 +77,31 @@ class StandardAESCipher:
         # 生成密钥流
         key_stream = self._generate_key_stream(iv, len(encrypted_data))
         # XOR 解密
-        return bytes(a ^ b for a, b in zip(encrypted_data, key_stream))
+        out = bytearray(len(encrypted_data))
+        mv_out = memoryview(out)
+        mv_enc = memoryview(encrypted_data)
+        mv_key = memoryview(key_stream)
+        step = 1024 * 64
+        for offset in range(0, len(encrypted_data), step):
+            end = offset + step if offset + step < len(encrypted_data) else len(encrypted_data)
+            mv_out[offset:end] = bytes(a ^ b for a, b in zip(mv_enc[offset:end], mv_key[offset:end]))
+        return bytes(out)
     
     def _generate_key_stream(self, iv: bytes, length: int) -> bytes:
-        """生成密钥流"""
-        key_stream = b""
+        """生成密钥流（避免重复拼接导致的 O(n^2)）"""
+        out = bytearray(length)
+        write_pos = 0
         counter = 0
-        while len(key_stream) < length:
-            # 使用 HMAC 生成伪随机字节
+        digest_size = hashlib.sha256().digest_size
+        while write_pos < length:
             counter_bytes = counter.to_bytes(4, 'big')
             h = hmac.new(self.key, iv + counter_bytes, hashlib.sha256)
-            key_stream += h.digest()
+            block = h.digest()
+            take = digest_size if write_pos + digest_size <= length else (length - write_pos)
+            out[write_pos:write_pos+take] = block[:take]
+            write_pos += take
             counter += 1
-        return key_stream[:length]
+        return bytes(out)
 
 
 """
@@ -107,6 +126,7 @@ class StandardAESCipher:
 
 DEFAULT_PORT = 50080
 RECV_BUF = 1024 * 64
+ENCRYPT_CHUNK_SIZE = 1024 * 1024 * 4  # 4MB 加密块，减少每块的 IV/HMAC 开销
 
 
 def _read_exact(sock: socket.socket, nbytes: int) -> bytes:
@@ -211,71 +231,40 @@ def send_file(host: str, port: int, filepath: str, timeout: float = 30.0, show_p
     filename = os.path.basename(filepath)
     filesize = os.path.getsize(filepath)
     
-    # 如果启用了加密，需要先加密文件
+    # 如果启用了加密，改为流式：边读边加密边发送（帧格式：4字节长度 + 加密块）
     if cipher:
-        # 创建临时加密文件
-        temp_path = filepath + ".tmp.enc"
-        try:
-            with open(filepath, "rb") as f_in, open(temp_path, "wb") as f_out:
-                # 分块加密文件，每个块独立加密，并写入长度前缀，确保接收端解密时按块对齐
+        header = {
+            "type": "file",
+            "timestamp": time.time(),
+            "sender": socket.gethostname(),
+            "filename": filename,
+            # streaming 模式下总线长未知，使用 -1 并携带原始大小供展示
+            "filesize": -1,
+            "orig_filesize": filesize,
+            "encrypted": True,
+            "streaming": True
+        }
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            header_bytes = json.dumps(header, ensure_ascii=False).encode("utf-8")
+            s.sendall(struct.pack(">I", len(header_bytes)))
+            s.sendall(header_bytes)
+            sent_plain = 0  # 明文已发送字节数（用于进度）
+            start = time.time()
+            with open(filepath, "rb") as f_in:
                 while True:
-                    chunk = f_in.read(RECV_BUF)
+                    chunk = f_in.read(ENCRYPT_CHUNK_SIZE)
                     if not chunk:
                         break
                     encrypted_chunk = cipher.encrypt(chunk)
-                    # 写入 4 字节大端长度前缀，随后写入该加密块
-                    f_out.write(struct.pack(">I", len(encrypted_chunk)))
-                    f_out.write(encrypted_chunk)
-            
-            # 更新文件大小为加密后的大小
-            encrypted_filesize = os.path.getsize(temp_path)
-            header = {
-                "type": "file",
-                "timestamp": time.time(),
-                "sender": socket.gethostname(),
-                "filename": filename,
-                "filesize": encrypted_filesize,
-                "encrypted": True
-            }
-            
-            # 发送加密后的文件
-            with socket.create_connection((host, port), timeout=timeout) as s:
-                header_bytes = json.dumps(header, ensure_ascii=False).encode("utf-8")
-                s.sendall(struct.pack(">I", len(header_bytes)))
-                s.sendall(header_bytes)
-                sent = 0
-                start = time.time()
-                with open(temp_path, "rb") as f:
-                    # 按长度前缀格式发送加密文件
-                    while True:
-                        # 读取长度前缀
-                        len_bytes = f.read(4)
-                        if not len_bytes:
-                            break
-                        if len(len_bytes) != 4:
-                            raise ValueError("加密文件长度前缀不完整")
-                        (enc_len,) = struct.unpack(">I", len_bytes)
-                        if enc_len <= 0:
-                            raise ValueError("非法的加密块长度")
-                        
-                        # 读取加密块
-                        enc_chunk = f.read(enc_len)
-                        if len(enc_chunk) != enc_len:
-                            raise ValueError("加密块长度不匹配")
-                        
-                        # 发送长度前缀 + 加密块
-                        s.sendall(len_bytes)
-                        s.sendall(enc_chunk)
-                        sent += 4 + enc_len
-                        if show_progress:
-                            _print_progress(f"Sending {filename}", sent, encrypted_filesize, start)
-                if show_progress:
-                    _print_progress(f"Sending {filename}", encrypted_filesize, encrypted_filesize, start)
-                    print("")
-        finally:
-            # 删除临时加密文件
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+                    # 发送 4B 长度 + 加密块
+                    s.sendall(struct.pack(">I", len(encrypted_chunk)))
+                    s.sendall(encrypted_chunk)
+                    sent_plain += len(chunk)
+                    if show_progress:
+                        _print_progress(f"Sending {filename}", sent_plain, filesize, start)
+            if show_progress:
+                _print_progress(f"Sending {filename}", filesize, filesize, start)
+                print("")
     else:
         header = {
             "type": "file",
@@ -335,6 +324,8 @@ def _handle_conn(conn: socket.socket, addr: Tuple[str, int], save_dir: str, ciph
         elif msg_type == "file":
             filename = header.get("filename", f"file_{int(ts)}")
             filesize = int(header.get("filesize", 0))
+            streaming = bool(header.get("streaming", False))
+            orig_filesize = int(header.get("orig_filesize", 0))
             os.makedirs(save_dir, exist_ok=True)
             safe_name = os.path.basename(filename)
             out_path = os.path.join(save_dir, safe_name)
@@ -351,26 +342,44 @@ def _handle_conn(conn: socket.socket, addr: Tuple[str, int], save_dir: str, ciph
             temp_path = out_path + ".tmp.enc" if is_encrypted else out_path
             with open(temp_path, "wb") as f:
                 if is_encrypted:
-                    # 加密文件按长度前缀格式接收
-                    while received < filesize:
-                        # 接收长度前缀
-                        len_bytes = _read_exact(conn, 4)
-                        (enc_len,) = struct.unpack(">I", len_bytes)
-                        if enc_len <= 0:
-                            raise ValueError("非法的加密块长度")
-                        
-                        # 接收加密块
-                        enc_chunk = _read_exact(conn, enc_len)
-                        
-                        # 写入长度前缀 + 加密块
-                        f.write(len_bytes)
-                        f.write(enc_chunk)
-                        received += 4 + enc_len
-                        
-                        now = time.time()
-                        if now - last_print >= 0.1:  # 限速刷新
-                            _print_progress(f"Receiving {safe_name}", received, filesize, start)
-                            last_print = now
+                    # 加密文件：按长度前缀帧接收。如果 streaming，则直到连接关闭；否则接收至指定大小
+                    if streaming or filesize < 0:
+                        # 直到连接关闭
+                        while True:
+                            len_bytes = conn.recv(4)
+                            if not len_bytes:
+                                break
+                            if len(len_bytes) < 4:
+                                len_bytes += _read_exact(conn, 4 - len(len_bytes))
+                            (enc_len,) = struct.unpack(">I", len_bytes)
+                            if enc_len <= 0:
+                                raise ValueError("非法的加密块长度")
+                            enc_chunk = _read_exact(conn, enc_len)
+                            f.write(len_bytes)
+                            f.write(enc_chunk)
+                            received += 4 + enc_len
+                            now = time.time()
+                            total_show = orig_filesize if orig_filesize > 0 else max(orig_filesize, received)
+                            if now - last_print >= 0.1:
+                                _print_progress(f"Receiving {safe_name}", received, total_show, start)
+                                last_print = now
+                    else:
+                        # 基于 filesize 的严格接收
+                        while received < filesize:
+                            # 接收长度前缀
+                            len_bytes = _read_exact(conn, 4)
+                            (enc_len,) = struct.unpack(">I", len_bytes)
+                            if enc_len <= 0:
+                                raise ValueError("非法的加密块长度")
+                            # 接收加密块
+                            enc_chunk = _read_exact(conn, enc_len)
+                            f.write(len_bytes)
+                            f.write(enc_chunk)
+                            received += 4 + enc_len
+                            now = time.time()
+                            if now - last_print >= 0.1:
+                                _print_progress(f"Receiving {safe_name}", received, filesize, start)
+                                last_print = now
                 else:
                     # 未加密文件按原方式接收
                     while received < filesize:
